@@ -138,7 +138,7 @@ const txSchema: Schema = {
   objectId: {
     type: 'text',
     notNull: false,
-    index: false
+    index: true
   }
 }
 
