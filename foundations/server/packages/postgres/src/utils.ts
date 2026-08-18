@@ -92,6 +92,15 @@ export async function createTables (
   const domainsToLoad = mapped.filter((it) => loadedTables.has(it))
   if (domainsToLoad.length > 0) {
     await ctx.with('load-schemas', {}, () => getTableSchema(client, domainsToLoad))
+    // Existing tables predate schema changes that mark additional fields as indexed
+    // (e.g. a field flipped from index: false to true, or a table created by an older
+    // version of this schema) — reconcile them here rather than only at table-creation
+    // time, or such tables silently keep missing indexes forever.
+    await retryTxn(client, async (client) => {
+      for (const domain of domainsToLoad) {
+        await ctx.with('ensure-indexes', {}, () => ensureIndexes(client, domain))
+      }
+    })
   }
   const domainsToCreate: string[] = []
   for (const domain of mapped) {
@@ -127,7 +136,13 @@ async function getTableSchema (client: postgres.Sql, domains: string[]): Promise
     const schema = schemas[column.table_name] ?? {}
     schemas[column.table_name] = schema
 
-    schema[column.column_name] = {
+    // This table already exists, but its compile-time schema (an explicit domainSchemas
+    // entry, or the defaultSchema fallback) still reflects the indexes it's meant to have.
+    // Preserve that field's type/index/indexType rather than resetting index to false —
+    // only a genuinely undeclared (e.g. plugin-added) column falls back to a discovered,
+    // conservatively-unindexed guess.
+    const known = getSchema(column.table_name)[column.column_name]
+    schema[column.column_name] = known ?? {
       type: parseDataType(column.data_type),
       notNull: column.is_nullable === 'NO',
       index: false
@@ -160,21 +175,26 @@ async function createTable (client: postgres.Sql, domain: string): Promise<void>
     fields.push(`"${key}" ${val.type} ${val.notNull ? 'NOT NULL' : ''}`)
   }
   const colums = fields.join(', ')
-  const res = await client.unsafe(`CREATE TABLE IF NOT EXISTS ${domain} (
+  await client.unsafe(`CREATE TABLE IF NOT EXISTS ${domain} (
       "workspaceId" uuid NOT NULL,
-      ${colums}, 
+      ${colums},
       data JSONB NOT NULL,
       PRIMARY KEY("workspaceId", _id)
     )`)
-  if (res.count > 0) {
-    for (const key in schema) {
-      const val = schema[key]
-      if (val.index) {
-        await client.unsafe(`
-          CREATE INDEX ${domain}_${key} ON ${domain} ${getIndex(val)} ("${key}")
-        `)
-      }
-      fields.push(`"${key}" ${val.type} ${val.notNull ? 'NOT NULL' : ''}`)
+  await ensureIndexes(client, domain, schema)
+}
+
+// Creates any index the schema declares (val.index === true) that doesn't exist yet.
+// IF NOT EXISTS makes this safe to call every time a domain is loaded, not just at
+// initial table creation — see createTables' domainsToLoad handling above.
+async function ensureIndexes (client: postgres.Sql, domain: string, schema?: Schema): Promise<void> {
+  schema = schema ?? getSchema(domain)
+  for (const key in schema) {
+    const val = schema[key]
+    if (val.index) {
+      await client.unsafe(`
+        CREATE INDEX IF NOT EXISTS ${domain}_${key} ON ${domain} ${getIndex(val)} ("${key}")
+      `)
     }
   }
 }
