@@ -138,6 +138,22 @@ async function * createCursorGenerator (
   }
 }
 
+// Domains that accumulate large, per-object histories (activity feeds, the
+// tx log, notifications, collaborator lists) which keep growing with a
+// workspace's age and aren't bounded by their own filter - e.g. "all
+// activity for this task" can be thousands of rows for an old, busy task.
+// `findAll` already supports an opt-in `options.memoryLimit` that streams
+// results through a cursor and aborts once a size cap is hit (see below),
+// but it's only applied when a caller explicitly asks for it. A caller that
+// queries one of these domains without passing `limit` or `memoryLimit`
+// gets a single unbounded `SELECT * ... ORDER BY` - dozens of these running
+// concurrently (one per open task/object) OOMKilled the cockroach pod 6x on
+// 2026-07-17. This is a safety net, not a correctness fix: it reuses the
+// existing memoryLimit cursor path as a default instead of leaving these
+// specific domains truly unbounded when a caller forgets to pass one.
+const UNBOUNDED_FIND_RISK_DOMAINS = new Set(['tx', 'activity', 'notification', 'collaborator'])
+const DEFAULT_UNBOUNDED_FIND_MEMORY_LIMIT = 64 * 1024 * 1024 // 64MB per query
+
 class ValuesVariables {
   index: number = 1
   values: any[] = []
@@ -517,7 +533,16 @@ abstract class PostgresAdapterBase implements DbAdapter {
             fquery = finalSql
 
             let result: DBResult = Object.assign([], { count: 0 })
-            if (options?.memoryLimit === undefined) {
+            // No explicit limit/memoryLimit from the caller: for domains known to
+            // accumulate unbounded per-object history, fall back to a default
+            // memoryLimit instead of a single unbounded fetch - see
+            // UNBOUNDED_FIND_RISK_DOMAINS above.
+            const effectiveMemoryLimit =
+              options?.memoryLimit ??
+              (options?.limit === undefined && UNBOUNDED_FIND_RISK_DOMAINS.has(domain)
+                ? DEFAULT_UNBOUNDED_FIND_MEMORY_LIMIT
+                : undefined)
+            if (effectiveMemoryLimit === undefined) {
               result = await connection.execute(finalSql, vars.getValues())
             } else {
               let currentSize = 0
@@ -526,16 +551,16 @@ abstract class PostgresAdapterBase implements DbAdapter {
               const cursor = connection
                 .raw()
                 .unsafe(finalSql, doFetchTypes ? params : convertArrayParams(params))
-                .cursor(options.bulkSize ?? 1000)
+                .cursor(options?.bulkSize ?? 1000)
 
               try {
                 for await (const part of cursor) {
                   for (const pp of part) {
                     result.push(pp)
                     currentSize += estimateDocSize(pp)
-                    if (currentSize > options.memoryLimit) {
+                    if (currentSize > effectiveMemoryLimit) {
                       throw new Error(
-                        `Memory limit of ${options.memoryLimit} bytes exceeded in findAll. Current size: ${currentSize} bytes`
+                        `Memory limit of ${effectiveMemoryLimit} bytes exceeded in findAll. Current size: ${currentSize} bytes`
                       )
                     }
                   }
