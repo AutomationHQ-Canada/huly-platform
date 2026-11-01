@@ -1,0 +1,105 @@
+name: AHQ Build and Push to ECR
+
+# Scoped, AHQ-specific build: only the 4 services that depend on
+# @hcengineering/postgres (account, transactor/pod-server, workspace,
+# fulltext) - the ones that need a patched image to pick up fork-specific
+# fixes like fix/unbounded-findall-memory-safety (PR #2). front/kvs/etc are
+# unaffected and stay on upstream's hardcoreeng images.
+#
+# Deliberately skips the full main.yml test matrix (svelte-check/uitest/etc)
+# to stay fast - this is an internal dev-environment build, not a release.
+# Pushes to AHQ's own ECR (501429054313.dkr.ecr.us-east-2.amazonaws.com),
+# not Docker Hub - main.yml's docker-build job still targets hardcoreeng
+# and is unaffected by this workflow.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version_tag:
+        description: "Tag for the ECR images (e.g. v0.7.426-postgres-memlimit-fix)"
+        required: true
+
+concurrency:
+  group: ahq-ecr-build
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: us-east-2
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          filter: tree:0
+          submodules: recursive
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version-file: ".nvmrc"
+
+      - name: Cache node modules
+        uses: actions/cache@v6
+        with:
+          path: |
+            common/temp
+          key: ${{ runner.os }}-build-node-${{ hashFiles('**/pnpm-lock.yaml') }}
+          restore-keys: |
+            ${{ runner.os }}-build-node-${{ hashFiles('**/pnpm-lock.yaml') }}
+
+      - name: Install
+        run: node common/scripts/install-run-rush.js install
+
+      - name: Build + package account/transactor/workspace/fulltext
+        env:
+          DOCKER_VERSION: ${{ inputs.version_tag }}
+          DOCKER_CLI_HINTS: false
+        run: |
+          node common/scripts/install-run-rush.js docker:build -p 4 \
+            --to @hcengineering/pod-account \
+            --to @hcengineering/pod-server \
+            --to @hcengineering/pod-workspace \
+            --to @hcengineering/pod-fulltext
+
+      - name: Configure AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Tag and push to ECR
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          TAG: ${{ inputs.version_tag }}
+        run: |
+          set -euo pipefail
+          for svc in account transactor workspace fulltext; do
+            echo "Pushing ${svc}:${TAG}"
+            docker tag "hardcoreeng/${svc}:${TAG}" "${ECR_REGISTRY}/${svc}:${TAG}"
+            docker push "${ECR_REGISTRY}/${svc}:${TAG}"
+          done
+
+      - name: Summary
+        if: always()
+        env:
+          TAG: ${{ inputs.version_tag }}
+        run: |
+          {
+            echo "## AHQ ECR build"
+            echo ""
+            echo "Tag: \`${TAG}\`"
+            echo ""
+            echo "| Service | Image |"
+            echo "|---|---|"
+            for svc in account transactor workspace fulltext; do
+              echo "| ${svc} | \`501429054313.dkr.ecr.us-east-2.amazonaws.com/${svc}:${TAG}\` |"
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
